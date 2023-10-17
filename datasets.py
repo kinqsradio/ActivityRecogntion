@@ -242,12 +242,6 @@ def create_datasets(yolo_model,
 
             # Appending to training list
             clear_output(wait=True)
-
-            if len(combined_features.shape) == 1:
-                print("The combined features is flattened.")
-            else:
-                print("The combined features is not flattened, flattening now.")
-                combined_features = combined_features.flatten()
             features.append(combined_features)
             labels.append(class_index)
             video_files_paths.append(video_file_path)
