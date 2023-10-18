@@ -9,7 +9,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 import torch
 import torch.nn.functional as F
-from keras.preprocessing.sequence import pad_sequences
+# from keras.preprocessing.sequence import pad_sequences
+from keras.utils import pad_sequences # 2.12
 from sklearn.decomposition import PCA
 
 # Local imports
@@ -183,13 +184,12 @@ def create_datasets(yolo_model,
             heatmaps_tensor = torch.tensor(heatmaps).float().repeat(1, 3, 1, 1)
             print('Heatmaps generated.')
 
-            # ROIS
-            roi_imgs = torch.stack([F.interpolate(torch.tensor(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)).unsqueeze(0).unsqueeze(0),
-                                            size=(IMAGE_HEIGHT, IMAGE_WIDTH), mode='bilinear').squeeze()
-                                for frame in roi_frames]).unsqueeze(1).numpy()
-            # Normalizing roi_imgs
-            roi_imgs = roi_imgs / 255.0
-            roi_imgs_tensor = torch.tensor(roi_imgs).float().repeat(1, 3, 1, 1)
+            # ROIs
+            roi_imgs = torch.stack([F.interpolate(torch.tensor(frame.astype(np.float32) / 255.0).permute(2, 0, 1).float().unsqueeze(0), 
+                                                    size=(IMAGE_HEIGHT, IMAGE_WIDTH), mode='bilinear').squeeze()
+                                    for frame in roi_frames])
+            roi_tensor = roi_imgs.float()
+
             
             print('ROIs generated.')
 
@@ -215,7 +215,7 @@ def create_datasets(yolo_model,
             # Features extraction using Resnet (Spatial) (Temporal)
             print('Features extracted using ResNet.')
             with torch.no_grad():
-                spatial_features = spatial_resnet(roi_imgs_tensor).squeeze(-1).squeeze(-1)
+                spatial_features = spatial_resnet(roi_tensor).squeeze(-1).squeeze(-1)
                 temporal_features = temporal_resnet(heatmaps_tensor).squeeze(-1).squeeze(-1)
 
             # Attentions

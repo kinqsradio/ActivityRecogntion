@@ -121,8 +121,8 @@ def initialize_cnn_model(input_shape, num_classes):
 def train_model(model_name ,model, features, labels, batch_size, epochs, early_stopping_patience=5):
     # Compile the model
     model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3),
-                #   loss='sparse_categorical_crossentropy',
-                  loss = 'categorical_crossentropy',
+                  loss='sparse_categorical_crossentropy',
+                #   loss = 'categorical_crossentropy',
                   metrics=['accuracy'])
 
     # Callbacks

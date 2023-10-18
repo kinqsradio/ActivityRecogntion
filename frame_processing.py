@@ -77,6 +77,7 @@ def detect_and_track(frames, model):
             crop_region = init_crop_region(image_height, image_width)
 
             # Run model inference.
+            print('Extract Keypoints')
             keypoints_with_scores = run_inference(movenet, roi, crop_region, [input_size, input_size])
 
             # Draw prediction on the frame.

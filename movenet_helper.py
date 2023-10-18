@@ -431,14 +431,14 @@ def generate_heatmap_with_limbs(keypoints_with_scores, height, width):
 
 def combined_heatmap(keypoints_with_scores, height, width):
     # Generate heatmap for keypoints
-    # keypoints_heatmap = generate_heatmap_from_keypoints(keypoints_with_scores, height, width)
+    keypoints_heatmap = generate_heatmap_from_keypoints(keypoints_with_scores, height, width)
     
     # Generate heatmap for limbs
     limbs_heatmap = generate_heatmap_with_limbs(keypoints_with_scores, height, width)
     
     # Combine the two heatmaps
-    # combined = keypoints_heatmap + limbs_heatmap
-    combined = limbs_heatmap
+    combined = keypoints_heatmap + limbs_heatmap
+    # combined = limbs_heatmap
     
     # Normalize if necessary. In this case, I'm making sure values are clamped between 0 and 1.
     combined = np.clip(combined, 0, 1)

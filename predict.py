@@ -3,17 +3,75 @@ from movenet_helper import combined_heatmap
 from fuse_features import fuse_features
 import cv2
 import torch
+import torch.nn as nn
 import matplotlib.pyplot as plt
 import torch.nn.functional as F
 import numpy as np
 import tensorflow as tf
+
+
+class GradCAM:
+    def __init__(self, model, target_layer):
+        self.model = model
+        self.target_layer = target_layer
+        self.gradients = None
+        self.outputs = None
+        self.model.eval()
+        self.hook_layers()
+
+    def hook_layers(self):
+        def backward_hook_fn(module, grad_in, grad_out):
+            self.gradients = grad_in[0]
+            
+        def forward_hook_fn(module, input, output):
+            self.outputs = output
+
+        self.target_layer.register_backward_hook(backward_hook_fn)
+        self.target_layer.register_forward_hook(forward_hook_fn)
+
+    def generate_cam(self, input_tensor, target_category=None):
+        # Forward pass
+        model_output = self.model(input_tensor)
+        if target_category is None:
+            target_category = torch.argmax(model_output, dim=1).item()
+        
+        # Zero gradients everywhere
+        self.model.zero_grad()
+        
+        # Set the output for the target category to 1, and 0 for other categories
+        one_hot_output = torch.zeros((1, model_output.shape[-1]))
+        one_hot_output[0][target_category] = 1
+        
+        # Backward pass to get gradient information
+        model_output.backward(gradient=one_hot_output)
+        
+        # Get the target layer's output after the forward pass
+        target_layer_output = self.outputs[0]
+        
+        # Global Average Pooling (GAP) to get the weights
+        weights = torch.mean(self.gradients, dim=(2, 3))[0, :]
+        
+        # Weighted combination to get the attention map
+        cam = torch.zeros(target_layer_output.shape[1:]).to(input_tensor.device)
+        for i, w in enumerate(weights):
+            cam += w * target_layer_output[i, :, :]
+        
+        # ReLU to get only the positive values
+        cam = nn.ReLU()(cam)
+        
+        # Resize the CAM to the input tensor's size
+        cam = cam - torch.min(cam)
+        cam = cam / torch.max(cam)
+        cam = torch.nn.functional.interpolate(cam.unsqueeze(0).unsqueeze(0), size=input_tensor.shape[2:], mode="bilinear").squeeze().cpu().detach().numpy()
+        
+        return cam
 
 IMAGE_HEIGHT,IMAGE_WIDTH = 224,224
 
 def extract_frames(video_file):
     capture = cv2.VideoCapture(video_file)
     frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
-    EXTRACT_FREQUENCY = 3
+    EXTRACT_FREQUENCY = 2
     if frame_count // EXTRACT_FREQUENCY <= 16:
         EXTRACT_FREQUENCY -= 1
         if frame_count // EXTRACT_FREQUENCY <= 16:
@@ -48,7 +106,8 @@ def predict_on_video(video_path,
                      spatial_resnet, 
                      spatial_transformer, 
                      temporal_resnet, 
-                     temporal_transformer, 
+                     temporal_transformer,
+                     grad_cam, 
                      SEQUENCE_LENGTH, 
                      debug=False):
     """
@@ -85,11 +144,42 @@ def predict_on_video(video_path,
     # Extract frames from the video
     if debug: print("Extracting frames from video...")
     frames = extract_frames(video_path)
-    video_dims = (frames[0].shape[1], frames[0].shape[0])
+    # video_dims = (frames[0].shape[1], frames[0].shape[0])
+    video_dims = (frames[0].shape[1] * 2, frames[0].shape[0])
     output_video_path = output_video
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = cv2.VideoWriter(output_video_path, fourcc, 20.0, video_dims)
 
+    def overlay_heatmap_on_image(image, heatmap, colormap=cv2.COLORMAP_JET, alpha=0.6):
+        """
+        Overlay a heatmap on an image.
+        
+        Parameters:
+        - image: Original image.
+        - heatmap: 2D numpy array representing the heatmap.
+        - colormap: OpenCV colormap to apply to the heatmap.
+        - alpha: The blending factor. 1.0 means only heatmap, 0.0 means only image.
+        
+        Returns:
+        - Blended image.
+        """
+        # Resize heatmap to the size of the image
+        heatmap_resized = cv2.resize(heatmap, (image.shape[1], image.shape[0]))
+        # Convert the heatmap to RGB
+        heatmap_colored = cv2.applyColorMap((heatmap_resized * 255).astype(np.uint8), colormap)
+        # Blend the image and the heatmap
+        blended = cv2.addWeighted(image, 1 - alpha, heatmap_colored, alpha, 0)
+        
+        return blended
+    
+    def display_frame(frame):
+        # Convert from BGR to RGB for proper display in matplotlib
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        plt.imshow(frame_rgb)
+        plt.axis('off')  # Hide axis values
+        plt.show()
+
+    
     for frame in frames:
         if debug: print("Processing frame...")
         
@@ -112,18 +202,19 @@ def predict_on_video(video_path,
         heatmap_tensor = torch.tensor(heatmap).float().repeat(1, 3, 1, 1)
 
         # Process the ROI
+        # Process the ROI for ResNet and GradCAM
         if debug: print("Processing ROI...")
-        gray_roi = cv2.cvtColor(roi_frame, cv2.COLOR_BGR2GRAY)
-        roi_img = torch.tensor(gray_roi).unsqueeze(0).unsqueeze(0)
-        roi_img = F.interpolate(roi_img, size=(IMAGE_HEIGHT, IMAGE_WIDTH), mode='bilinear').squeeze().numpy() 
-        roi_img = roi_img / 255.0
-        roi_img_tensor = torch.tensor(roi_img).float().repeat(1, 3, 1, 1)
-        
+        resized_roi = cv2.resize(roi_frame, (IMAGE_HEIGHT, IMAGE_WIDTH))
+        normalized_roi = resized_roi.astype(np.float32) / 255.0
+        roi_tensor = torch.tensor(normalized_roi).permute(2, 0, 1).unsqueeze(0).float()
+
+        # Generate attention heatmap for the ROI using GradCAM and ResNet
+        roi_heatmap = grad_cam.generate_cam(roi_tensor)
         
         # Extract spatial and temporal features
         if debug: print("Extracting spatial and temporal features...")
         with torch.no_grad():
-            spatial_features = spatial_resnet(roi_img_tensor).squeeze(-1).squeeze(-1)
+            spatial_features = spatial_resnet(roi_tensor).squeeze(-1).squeeze(-1)
             temporal_features = temporal_resnet(heatmap_tensor).squeeze(-1).squeeze(-1)
 
         # Transform features using transformers
@@ -152,15 +243,24 @@ def predict_on_video(video_path,
             # Aggregate predictions for voting
             aggregated_predictions = [raw_predictions_lstm, raw_predictions_dense, raw_predictions_cnn]
 
+
             # Determine the class index from the averaged predictions
             class_index = combined_voting(aggregated_predictions)
             text = f"Predicted: {CLASSES_LIST[class_index]}"
             print(text)
-            cv2.putText(frame, text, (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 0, 0), 3, cv2.LINE_AA)
+            cv2.putText(frame, text, (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 0, 0), 2, cv2.LINE_AA)
             feature_buffer.pop(0)  # Slide the window
             frames_buffer.pop(0)
+            
+        # Overlay the heatmap on the frame
+        frame_with_attention = overlay_heatmap_on_image(frame, roi_heatmap)
+        # Concatenate the frame_with_attention (on the left) with the normal frame (on the right)
+        combined_frame = np.hstack((frame_with_attention, frame))
 
-        out.write(frame)
+        if debug:
+            display_frame(combined_frame)
+
+        out.write(combined_frame)
         
     if 0 < len(feature_buffer) < SEQUENCE_LENGTH:
         if debug: print("Duplicating the last feature to fill the buffer...")
@@ -177,7 +277,7 @@ def predict_on_video(video_path,
         sequence_frames = np.array([frames_buffer]) 
         sequence_features = np.array(feature_buffer).reshape(1, SEQUENCE_LENGTH, -1)
         
-        # Get raw predictions from both models
+         # Get raw predictions from all models
         raw_predictions_lstm = lstm_model.predict(sequence_features)
         raw_predictions_dense = dense_model.predict(sequence_features)
         raw_predictions_cnn = cnn_model.predict(sequence_frames)
@@ -189,6 +289,15 @@ def predict_on_video(video_path,
     
         text = f"Predicted: {CLASSES_LIST[class_index]}"
         print(text)
-        cv2.putText(frame, text, (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 0, 0), 3, cv2.LINE_AA)
-        out.write(frame)
+        cv2.putText(frame, text, (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 0, 0), 2, cv2.LINE_AA)
+
+        # Overlay the heatmap on the frame
+        frame_with_attention = overlay_heatmap_on_image(frame, roi_heatmap)
+        # Concatenate the frame_with_attention (on the left) with the normal frame (on the right)
+        combined_frame = np.hstack((frame_with_attention, frame))
+
+        if debug:
+            display_frame(combined_frame)
+
+        out.write(combined_frame)
     out.release()
