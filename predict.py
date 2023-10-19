@@ -1,102 +1,82 @@
-from frame_processing import detect_and_track
-from movenet_helper import combined_heatmap
-from fuse_features import fuse_features
+from detect_track import detect_track
+from movenet_helper import *
+import numpy as np
+import matplotlib.pyplot as plt
 import cv2
 import torch
-import torch.nn as nn
-import matplotlib.pyplot as plt
 import torch.nn.functional as F
-import numpy as np
-import tensorflow as tf
+import warnings
+warnings.filterwarnings('ignore')
 
 
-class GradCAM:
-    def __init__(self, model, target_layer):
-        self.model = model
-        self.target_layer = target_layer
-        self.gradients = None
-        self.outputs = None
-        self.model.eval()
-        self.hook_layers()
+# Intialized some values
+IMAGE_HEIGHT, IMAGE_WIDTH = 224, 224
 
-    def hook_layers(self):
-        def backward_hook_fn(module, grad_in, grad_out):
-            self.gradients = grad_in[0]
-            
-        def forward_hook_fn(module, input, output):
-            self.outputs = output
+def display_frame(frame):
+        # Convert from BGR to RGB for proper display in matplotlib
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        plt.imshow(frame_rgb)
+        plt.axis('off')  # Hide axis values
+        plt.show()
 
-        self.target_layer.register_backward_hook(backward_hook_fn)
-        self.target_layer.register_forward_hook(forward_hook_fn)
 
-    def generate_cam(self, input_tensor, target_category=None):
-        # Forward pass
-        model_output = self.model(input_tensor)
-        if target_category is None:
-            target_category = torch.argmax(model_output, dim=1).item()
-        
-        # Zero gradients everywhere
-        self.model.zero_grad()
-        
-        # Set the output for the target category to 1, and 0 for other categories
-        one_hot_output = torch.zeros((1, model_output.shape[-1]))
-        one_hot_output[0][target_category] = 1
-        
-        # Backward pass to get gradient information
-        model_output.backward(gradient=one_hot_output)
-        
-        # Get the target layer's output after the forward pass
-        target_layer_output = self.outputs[0]
-        
-        # Global Average Pooling (GAP) to get the weights
-        weights = torch.mean(self.gradients, dim=(2, 3))[0, :]
-        
-        # Weighted combination to get the attention map
-        cam = torch.zeros(target_layer_output.shape[1:]).to(input_tensor.device)
-        for i, w in enumerate(weights):
-            cam += w * target_layer_output[i, :, :]
-        
-        # ReLU to get only the positive values
-        cam = nn.ReLU()(cam)
-        
-        # Resize the CAM to the input tensor's size
-        cam = cam - torch.min(cam)
-        cam = cam / torch.max(cam)
-        cam = torch.nn.functional.interpolate(cam.unsqueeze(0).unsqueeze(0), size=input_tensor.shape[2:], mode="bilinear").squeeze().cpu().detach().numpy()
-        
-        return cam
-
-IMAGE_HEIGHT,IMAGE_WIDTH = 224,224
-
-def extract_frames(video_file):
-    capture = cv2.VideoCapture(video_file)
-    frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
-    EXTRACT_FREQUENCY = 2
-    if frame_count // EXTRACT_FREQUENCY <= 16:
-        EXTRACT_FREQUENCY -= 1
-        if frame_count // EXTRACT_FREQUENCY <= 16:
-            EXTRACT_FREQUENCY -= 1
-            if frame_count // EXTRACT_FREQUENCY <= 16:
-                EXTRACT_FREQUENCY -= 1
-    count = 0
-    i = 0
-    retaining = True
-    frames_list = []
+def overlay_heatmap_on_image(image, heatmap, colormap=cv2.COLORMAP_JET, alpha=0.6):
+    # Resize heatmap to the size of the image
+    heatmap_resized = cv2.resize(heatmap, (image.shape[1], image.shape[0]))
+    # Convert the heatmap to RGB
+    heatmap_colored = cv2.applyColorMap((heatmap_resized * 255).astype(np.uint8), colormap)
+    # Blend the image and the heatmap
+    blended = cv2.addWeighted(image, 1 - alpha, heatmap_colored, alpha, 0)
     
-    while (count < frame_count and retaining):
-        retaining, frame = capture.read()
-        if frame is None:
-            continue
-        if count % EXTRACT_FREQUENCY == 0:
-            frames_list.append(frame)
-            i += 1
-        count += 1
-        
-    capture.release()
-    
-    return frames_list
+    return blended
 
-def predict_on_video(video_path, 
+def fuse_features(spatial_features, temporal_features):
+    # Combined Features
+    return np.concatenate([spatial_features, temporal_features], axis=-1)
+
+def model_predicts(lstm_model, dense_model, cnn_model, CLASSES_LIST, sequence_features, sequence_frames, sequence_rois, debug):
+    # Model Prediction
+    raw_predictions_lstm = lstm_model.predict(sequence_features)
+    raw_predictions_dense = dense_model.predict(sequence_features)
+    raw_predictions_cnn = cnn_model.predict(sequence_frames)
+    raw_predictions_cnn2 = cnn_model.predict(sequence_rois)
+
+    raw_predictions_cnn_avg = (raw_predictions_cnn + raw_predictions_cnn2) / 2.0
+
+    aggregated_predictions = [raw_predictions_lstm, raw_predictions_dense, raw_predictions_cnn_avg]
+
+    class_index = combined_voting(aggregated_predictions, CLASSES_LIST, debug)
+    text = f"{CLASSES_LIST[class_index]}"
+
+    return text
+
+def combined_voting(predictions, CLASSES_LIST, debug):
+    # Soft voting
+    summed = np.sum(predictions, axis=0)
+    softmax_probs = tf.nn.softmax(summed).numpy()
+    soft_vote = np.argmax(softmax_probs[0])  # Assuming 1 prediction for 1 frame
+    
+    # Hard voting
+    predicted_classes = [np.argmax(pred[0]) for pred in predictions]  # Assuming 1 prediction for 1 frame
+    hard_vote = max(set(predicted_classes), key=predicted_classes.count)
+
+    # Debug
+    if debug:
+        print(f"Soft Vote: {CLASSES_LIST[soft_vote]}")
+        print(f"Hard Vote: {CLASSES_LIST[hard_vote]}")
+        for i, pred in enumerate(predictions):
+            model_name = ["LSTM" ,"Dense", "CNN"][i]
+            # model_name = ["LSTM", "Dense", "CNN"][i]
+            print(f"\nModel: {model_name}")
+            for idx, class_name in enumerate(CLASSES_LIST):
+                print(f"{class_name}: {pred[0][idx] * 100:.2f}%")
+        print('\n')
+
+    # Combination logic:
+    # Take hard voting as final if it disagrees with soft voting
+    return hard_vote if soft_vote != hard_vote else soft_vote
+
+def predict_on_video(video_path,
                      output_video, 
                      CLASSES_LIST,
                      dense_model,
@@ -108,196 +88,206 @@ def predict_on_video(video_path,
                      temporal_resnet, 
                      temporal_transformer,
                      grad_cam, 
-                     SEQUENCE_LENGTH, 
-                     debug=False):
-    """
-    Predict the class of a video and save an annotated video with predicted actions.
-    """
-    feature_buffer = []
-    frames_buffer = []
+                     SEQUENCE_LENGTH,
+                     draw_skeleton, # BOOL
+                     draw_bbox, # BOOL
+                     debug): #BOOL
     
-    def combined_voting(predictions):
-        # Soft voting
-        summed = np.sum(predictions, axis=0)
-        softmax_probs = tf.nn.softmax(summed).numpy()
-        soft_vote = np.argmax(softmax_probs[0])  # Assuming 1 prediction for 1 frame
-        
-        # Hard voting
-        predicted_classes = [np.argmax(pred[0]) for pred in predictions]  # Assuming 1 prediction for 1 frame
-        hard_vote = max(set(predicted_classes), key=predicted_classes.count)
+    feature_buffer = {}
+    frames_buffer = {}
+    rois_buffer = {}
 
-        # Debug
+    cap = cv2.VideoCapture(video_path)
+
+    # Get the video's width, height and frames per second
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) * 2)
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps = cap.get(cv2.CAP_PROP_FPS)
+
+    # Define the codec and create a VideoWriter object
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v') # or use 'XVID'
+    out = cv2.VideoWriter(output_video, fourcc, fps, (width, height))
+
+
+    while cap.isOpened():
+        success, frame = cap.read()
+        if not success:
+            break
+        track_history = detect_track(frame, yolo_model)
+        for person_id, detections in track_history.items():
+            for roi, bbox, keypoints_with_scores in detections:
+                if debug: print(f'Processing id: {person_id}')
+                x1, y1, x2, y2 = bbox
+                
+                if debug: print(f'Draw Skeleton for id {person_id}')
+                if draw_skeleton:
+                    image_height, image_width, _ = roi.shape
+                    blank_image = np.zeros_like(roi)
+                    roi_poses = draw_prediction_on_image(blank_image, keypoints_with_scores, 
+                                                    crop_region=None, close_figure=True, output_image_height=image_height)
+
+                if debug: print(f'Draw  Boxes for id {person_id}')
+                if draw_bbox:
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)  # Draw a green bounding box
+
+                
+                if debug: print(f'Processing Heatmap for id {person_id}')
+                heatmap = combined_heatmap(keypoints_with_scores[0, 0], IMAGE_HEIGHT, IMAGE_WIDTH)
+                heatmap = torch.tensor(heatmap).unsqueeze(0).unsqueeze(0)
+                heatmap = F.interpolate(heatmap, size=(IMAGE_HEIGHT, IMAGE_WIDTH), mode='bilinear').squeeze().numpy()
+                max_value = np.max(heatmap)
+                if max_value > 0:  # Avoid division by zero
+                    heatmap = heatmap / max_value
+                heatmap_tensor = torch.tensor(heatmap).float().repeat(1, 3, 1, 1)
+                
+                if debug: print(f'Processing ROI for id {person_id}')
+                resized_roi = cv2.resize(roi, (IMAGE_HEIGHT, IMAGE_WIDTH))
+                normalized_roi = resized_roi.astype(np.float32) / 255.0
+                roi_tensor = torch.tensor(normalized_roi).permute(2, 0, 1).unsqueeze(0).float()
+
+                if debug: print(f'Processing frame for id {person_id}')
+                resized_frames = cv2.resize(frame, (IMAGE_WIDTH, IMAGE_HEIGHT)).astype(np.float32) / 255.0 # Normalize to [0, 1]
+
+                if debug: print(f'Extracting Features for id {person_id}')
+                with torch.no_grad():
+                    spatial_features = spatial_resnet(roi_tensor).squeeze(-1).squeeze(-1)
+                    temporal_features = temporal_resnet(heatmap_tensor).squeeze(-1).squeeze(-1)
+
+                if debug: print(f"Transforming features for id {person_id}")
+                spatial_features = spatial_transformer(spatial_features)
+                temporal_features = temporal_transformer(temporal_features)
+
+                if debug: print(f'Fuse features for id {person_id}')
+                combined_features = fuse_features(spatial_features.detach().numpy(), temporal_features.detach().numpy())
+
+                if debug: print(f'Appending buffers for id {person_id}')
+                if person_id not in feature_buffer:
+                    feature_buffer[person_id] = []
+                    frames_buffer[person_id] = []
+                    rois_buffer[person_id] = []
+                feature_buffer[person_id].append(combined_features)
+                frames_buffer[person_id].append(resized_frames)
+                rois_buffer[person_id].append(normalized_roi)
+                if debug:
+                    print(f'Id: {person_id}, Feautres buffer: {len(feature_buffer[person_id])}, Frames buffer: {len(feature_buffer[person_id])}, Rois buffer: {len(rois_buffer[person_id])}')
+
+                # START PREDICTION
+                for person_id in feature_buffer.keys():
+                    if len(feature_buffer[person_id]) == SEQUENCE_LENGTH:
+                        if debug: print('Start Prediction Process')
+                        if debug: print('Converting Buffers to Numpy')
+                        sequence_features = np.array(feature_buffer[person_id]).reshape(1, SEQUENCE_LENGTH, -1)
+                        sequence_frames = np.array([frames_buffer[person_id]])
+                        sequence_rois = np.array([rois_buffer[person_id]])
+
+                        # Aggregate predictions for voting
+                        final_predictions = model_predicts(lstm_model, dense_model, cnn_model, CLASSES_LIST, sequence_features, sequence_frames, sequence_rois, debug)
+                        if debug: print(f'Predicted: {final_predictions}')
+
+                        font_scale = 2
+                        (text_width, text_height), _ = cv2.getTextSize(final_predictions, cv2.FONT_HERSHEY_SIMPLEX, font_scale, 3)
+
+                        # Define the starting position of the text: just above the bounding box or at the top of the frame if the bbox is too high.
+                        start_x = int((x1 + x2) / 2 - text_width / 2)
+                        start_y = y1 - 10  # 10 pixels above the bbox
+
+                        # Check if the text fits in the frame, if not adjust.
+                        if start_y - text_height < 0:  
+                            start_y = y1 + text_height + 10 
+                        
+                        # Define the coordinates for the rectangle
+                        rect_start_x = start_x
+                        rect_start_y = start_y - text_height
+                        rect_end_x = start_x + text_width
+                        rect_end_y = start_y
+
+                        # Draw the white rectangle
+                        # cv2.rectangle(frame, (rect_start_x, rect_start_y), (rect_end_x, rect_end_y), (255, 255, 255), -1)  # -1 means filled rectangle
+
+                        # Draw the text
+                        cv2.putText(frame, final_predictions, (start_x, start_y), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 0), 2, cv2.LINE_AA)
+
+                        feature_buffer[person_id].pop(0)  # Slide the window
+                        frames_buffer[person_id].pop(0)
+                        rois_buffer[person_id].pop(0)
+            
+        #  FRAME DEBUG
+        normalized_frame = frame.astype(np.float32) / 255.0
+        frame_tensor = torch.tensor(normalized_frame).permute(2, 0, 1).unsqueeze(0).float()
+        frame_heatmap = grad_cam.generate_cam(frame_tensor)
+
+        # Attentions frame
+        frame_with_attention = overlay_heatmap_on_image(frame, frame_heatmap)
+        combined_frame = np.hstack((frame_with_attention, frame))
+        out.write(combined_frame)
         if debug:
-            print(f"Soft Vote: {CLASSES_LIST[soft_vote]}")
-            print(f"Hard Vote: {CLASSES_LIST[hard_vote]}")
-            for i, pred in enumerate(predictions):
-                model_name = ["LSTM", "Dense", "CNN"][i]
-                print(f"\nModel: {model_name}")
-                for idx, class_name in enumerate(CLASSES_LIST):
-                    print(f"{class_name}: {pred[0][idx] * 100:.2f}%")
-                print('\n')
+            # FRAME
+            display_frame(combined_frame)
+    # Duplicate Last Frame
+    for person_id in feature_buffer.keys():
+        if len(feature_buffer[person_id]) < SEQUENCE_LENGTH:
+            if debug: print('Start Prediction Process')
+            if debug: print("Duplicating the last feature to fill the buffer...")
 
-        # Combination logic:
-        # Take hard voting as final if it disagrees with soft voting
-        return hard_vote if soft_vote != hard_vote else soft_vote
-    
-    # Extract frames from the video
-    if debug: print("Extracting frames from video...")
-    frames = extract_frames(video_path)
-    # video_dims = (frames[0].shape[1], frames[0].shape[0])
-    video_dims = (frames[0].shape[1] * 2, frames[0].shape[0])
-    output_video_path = output_video
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = cv2.VideoWriter(output_video_path, fourcc, 20.0, video_dims)
+            # Features
+            num_duplicates_needed = SEQUENCE_LENGTH - len(feature_buffer[person_id])
+            last_feature = feature_buffer[person_id][-1]
+            duplicated_features = [last_feature] * num_duplicates_needed
+            feature_buffer[person_id].extend(duplicated_features)
 
-    def overlay_heatmap_on_image(image, heatmap, colormap=cv2.COLORMAP_JET, alpha=0.6):
-        """
-        Overlay a heatmap on an image.
-        
-        Parameters:
-        - image: Original image.
-        - heatmap: 2D numpy array representing the heatmap.
-        - colormap: OpenCV colormap to apply to the heatmap.
-        - alpha: The blending factor. 1.0 means only heatmap, 0.0 means only image.
-        
-        Returns:
-        - Blended image.
-        """
-        # Resize heatmap to the size of the image
-        heatmap_resized = cv2.resize(heatmap, (image.shape[1], image.shape[0]))
-        # Convert the heatmap to RGB
-        heatmap_colored = cv2.applyColorMap((heatmap_resized * 255).astype(np.uint8), colormap)
-        # Blend the image and the heatmap
-        blended = cv2.addWeighted(image, 1 - alpha, heatmap_colored, alpha, 0)
-        
-        return blended
-    
-    def display_frame(frame):
-        # Convert from BGR to RGB for proper display in matplotlib
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        plt.imshow(frame_rgb)
-        plt.axis('off')  # Hide axis values
-        plt.show()
+            # Frames 
+            num_duplicates_needed = SEQUENCE_LENGTH - len(frames_buffer[person_id])
+            last_frame = frames_buffer[person_id][-1]
+            duplicated_frames = [last_frame] * num_duplicates_needed
+            frames_buffer[person_id].extend(duplicated_frames)
 
-    
-    for frame in frames:
-        if debug: print("Processing frame...")
-        
-        results = list(detect_and_track([frame], yolo_model))
-        
-        if not results:
-            out.write(frame)
-            continue
 
-        _, roi_frame, _, _, keypoints_with_scores = results[0]
+            # ROIS
+            num_duplicates_needed = SEQUENCE_LENGTH - len(rois_buffer[person_id])
+            last_frame = rois_buffer[person_id][-1]
+            duplicated_frames = [last_frame] * num_duplicates_needed
+            rois_buffer[person_id].extend(duplicated_frames)
 
-        # Generate heatmap for the keypoints
-        if debug: print("Generating heatmap...")
-        heatmap = combined_heatmap(keypoints_with_scores[0, 0], IMAGE_HEIGHT, IMAGE_WIDTH)
-        heatmap = torch.tensor(heatmap).unsqueeze(0).unsqueeze(0)
-        heatmap = F.interpolate(heatmap, size=(IMAGE_HEIGHT, IMAGE_WIDTH), mode='bilinear').squeeze().numpy()
-        max_value = np.max(heatmap)
-        if max_value > 0:  # Avoid division by zero
-            heatmap = heatmap / max_value
-        heatmap_tensor = torch.tensor(heatmap).float().repeat(1, 3, 1, 1)
 
-        # Process the ROI
-        # Process the ROI for ResNet and GradCAM
-        if debug: print("Processing ROI...")
-        resized_roi = cv2.resize(roi_frame, (IMAGE_HEIGHT, IMAGE_WIDTH))
-        normalized_roi = resized_roi.astype(np.float32) / 255.0
-        roi_tensor = torch.tensor(normalized_roi).permute(2, 0, 1).unsqueeze(0).float()
-
-        # Generate attention heatmap for the ROI using GradCAM and ResNet
-        roi_heatmap = grad_cam.generate_cam(roi_tensor)
-        
-        # Extract spatial and temporal features
-        if debug: print("Extracting spatial and temporal features...")
-        with torch.no_grad():
-            spatial_features = spatial_resnet(roi_tensor).squeeze(-1).squeeze(-1)
-            temporal_features = temporal_resnet(heatmap_tensor).squeeze(-1).squeeze(-1)
-
-        # Transform features using transformers
-        if debug: print("Transforming features...")
-        spatial_features = spatial_transformer(spatial_features)
-        temporal_features = temporal_transformer(temporal_features)
-
-        # Combine the features
-        if debug: print("Combining features...")
-        combined_features = fuse_features(spatial_features.detach().numpy(), temporal_features.detach().numpy())
-        feature_buffer.append(combined_features)
-        resized_frames = cv2.resize(frame, (IMAGE_WIDTH, IMAGE_HEIGHT)).astype(np.float32) / 255.0 # Normalize to [0, 1]
-        frames_buffer.append(resized_frames)
-        
-        # Make predictions if the buffer is full
-        if len(feature_buffer) == SEQUENCE_LENGTH:
-            if debug: print("Making prediction...")
-            sequence_frames = np.array([frames_buffer]) 
-            sequence_features = np.array(feature_buffer).reshape(1, SEQUENCE_LENGTH, -1)
-
-            # Get raw predictions from all models
-            raw_predictions_lstm = lstm_model.predict(sequence_features)
-            raw_predictions_dense = dense_model.predict(sequence_features)
-            raw_predictions_cnn = cnn_model.predict(sequence_frames)
+            if debug: print('Converting Buffers to Numpy')
+            sequence_features = np.array(feature_buffer[person_id]).reshape(1, SEQUENCE_LENGTH, -1)
+            sequence_frames = np.array([frames_buffer[person_id]])
+            sequence_rois = np.array([rois_buffer[person_id]])
 
             # Aggregate predictions for voting
-            aggregated_predictions = [raw_predictions_lstm, raw_predictions_dense, raw_predictions_cnn]
+            final_predictions = model_predicts(lstm_model, dense_model, cnn_model, CLASSES_LIST, sequence_features, sequence_frames, sequence_rois, debug)
+            if debug: print(f'Predicted: {final_predictions}')
 
+            font_scale = 1
+            (text_width, text_height), _ = cv2.getTextSize(final_predictions, cv2.FONT_HERSHEY_SIMPLEX, font_scale, 3)
 
-            # Determine the class index from the averaged predictions
-            class_index = combined_voting(aggregated_predictions)
-            text = f"Predicted: {CLASSES_LIST[class_index]}"
-            print(text)
-            cv2.putText(frame, text, (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 0, 0), 2, cv2.LINE_AA)
-            feature_buffer.pop(0)  # Slide the window
-            frames_buffer.pop(0)
+            # Define the starting position of the text: just above the bounding box or at the top of the frame if the bbox is too high.
+            start_x = int((x1 + x2) / 2 - text_width / 2)
+            start_y = y1 - 10  # 10 pixels above the bbox
+
+            # Check if the text fits in the frame, if not adjust.
+            if start_y - text_height < 0:  
+                start_y = y1 + text_height + 10 
             
-        # Overlay the heatmap on the frame
-        frame_with_attention = overlay_heatmap_on_image(frame, roi_heatmap)
-        # Concatenate the frame_with_attention (on the left) with the normal frame (on the right)
+            # Define the coordinates for the rectangle
+            rect_start_x = start_x
+            rect_start_y = start_y - text_height
+            rect_end_x = start_x + text_width
+            rect_end_y = start_y
+
+            # Draw the white rectangle
+            # cv2.rectangle(frame, (rect_start_x, rect_start_y), (rect_end_x, rect_end_y), (255, 255, 255), -1)  # -1 means filled rectangle
+
+            # Draw the text
+            cv2.putText(frame, final_predictions, (start_x, start_y), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 0), 2, cv2.LINE_AA)
+
+            feature_buffer[person_id].pop(0)  # Slide the window
+            frames_buffer[person_id].pop(0)
+            rois_buffer[person_id].pop(0)
+
+        frame_with_attention = overlay_heatmap_on_image(frame, frame_heatmap)
         combined_frame = np.hstack((frame_with_attention, frame))
-
-        if debug:
-            display_frame(combined_frame)
-
         out.write(combined_frame)
-        
-    if 0 < len(feature_buffer) < SEQUENCE_LENGTH:
-        if debug: print("Duplicating the last feature to fill the buffer...")
-        num_duplicates_needed = SEQUENCE_LENGTH - len(frames_buffer)
-        last_frame = frames_buffer[-1]
-        duplicated_frames = [last_frame] * num_duplicates_needed
-        frames_buffer.extend(duplicated_frames)
 
-        num_duplicates_needed = SEQUENCE_LENGTH - len(feature_buffer)
-        last_feature = feature_buffer[-1]
-        duplicated_features = [last_feature] * num_duplicates_needed
-        feature_buffer.extend(duplicated_features)
-
-        sequence_frames = np.array([frames_buffer]) 
-        sequence_features = np.array(feature_buffer).reshape(1, SEQUENCE_LENGTH, -1)
-        
-         # Get raw predictions from all models
-        raw_predictions_lstm = lstm_model.predict(sequence_features)
-        raw_predictions_dense = dense_model.predict(sequence_features)
-        raw_predictions_cnn = cnn_model.predict(sequence_frames)
-        # Aggregate predictions for voting
-        aggregated_predictions = [raw_predictions_lstm, raw_predictions_dense, raw_predictions_cnn]
-
-        # Determine the class index from the averaged predictions
-        class_index = combined_voting(aggregated_predictions)
-    
-        text = f"Predicted: {CLASSES_LIST[class_index]}"
-        print(text)
-        cv2.putText(frame, text, (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 0, 0), 2, cv2.LINE_AA)
-
-        # Overlay the heatmap on the frame
-        frame_with_attention = overlay_heatmap_on_image(frame, roi_heatmap)
-        # Concatenate the frame_with_attention (on the left) with the normal frame (on the right)
-        combined_frame = np.hstack((frame_with_attention, frame))
-
-        if debug:
-            display_frame(combined_frame)
-
-        out.write(combined_frame)
     out.release()
+    cap.release()

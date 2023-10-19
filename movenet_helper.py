@@ -139,6 +139,38 @@ KEYPOINT_EDGE_INDS_TO_COLOR = {
     (14, 16): 'c'
 }
 
+
+def draw_keypoints(frame, keypoints, confidence_threshold, offset):
+    y, x, c = frame.shape
+    shaped = np.squeeze(np.multiply(keypoints, [y, x, 1]))
+    
+    for kp in shaped:
+        ky, kx, kp_conf = kp
+        ky += offset[1]  # Add the y offset (bbox's top-left y coordinate)
+        kx += offset[0]  # Add the x offset (bbox's top-left x coordinate)
+        if kp_conf > confidence_threshold:
+            cv2.circle(frame, (int(kx), int(ky)), 4, (0, 255, 0), -1)
+ 
+
+def draw_connections(frame, keypoints, edges, confidence_threshold, offset):
+    y, x, c = frame.shape
+    shaped = np.squeeze(np.multiply(keypoints, [y, x, 1]))
+    
+    for edge, color in edges.items():
+        p1, p2 = edge
+        y1, x1, c1 = shaped[p1]
+        y2, x2, c2 = shaped[p2]
+        
+        # Offset the keypoints by the bbox's top-left corner
+        y1 += offset[1]
+        x1 += offset[0]
+        y2 += offset[1]
+        x2 += offset[0]
+        
+        if (c1 > confidence_threshold) & (c2 > confidence_threshold):      
+            cv2.line(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 0, 255), 2)
+
+
 def _keypoints_and_edges_for_display(keypoints_with_scores,
                                      height,
                                      width,
@@ -431,14 +463,14 @@ def generate_heatmap_with_limbs(keypoints_with_scores, height, width):
 
 def combined_heatmap(keypoints_with_scores, height, width):
     # Generate heatmap for keypoints
-    keypoints_heatmap = generate_heatmap_from_keypoints(keypoints_with_scores, height, width)
+    # keypoints_heatmap = generate_heatmap_from_keypoints(keypoints_with_scores, height, width)
     
     # Generate heatmap for limbs
     limbs_heatmap = generate_heatmap_with_limbs(keypoints_with_scores, height, width)
     
     # Combine the two heatmaps
-    combined = keypoints_heatmap + limbs_heatmap
-    # combined = limbs_heatmap
+    # combined = keypoints_heatmap + limbs_heatmap
+    combined = limbs_heatmap
     
     # Normalize if necessary. In this case, I'm making sure values are clamped between 0 and 1.
     combined = np.clip(combined, 0, 1)
